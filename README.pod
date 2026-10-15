@@ -1,0 +1,219 @@
+=head1 NAME
+
+check_pgbouncer - pgBouncer plugin for Nagios
+
+=head1 SYNOPSIS
+
+  check_pgbouncer {-w|--warning THRESHOLD} {-c|--critical THRESHOLD} [-s|--service SERVICE ] [-h|--host HOST] [-U|--username ROLE] [-p|--port PORT] [-d|--dbname DATABASE] [-S|--dbservice SERVICE_NAME] [-P|--psql PATH] [--debug]
+  check_pgbouncer [-l|--list]
+  check_pgbouncer [--help]
+
+=head1 DESCRIPTION
+
+check_pgbouncer is designed to monitor pgBouncer service from Nagios. It offers
+many options to measure and monitor useful performance metrics.
+
+=head1 COMPATIBILITY
+
+Each service is available from a different pgBouncer version.
+
+Ideally, the psql client should be 8.4 at least. If your client is older, see
+C<--psql> and C<--old-psql> for more information.
+
+Please report any undocumented incompatibility.
+
+=over
+
+=item B<-s>, B<--service> SERVICE
+
+The Nagios service to run. See section SERVICES for a description of available
+services or use C<--list> for a short service and description list.
+
+=item B<-h>, B<--host> HOST
+
+pgBouncer server host or socket directory (default: $PGHOST or "localhost")
+
+See section C<CONNECTIONS> for more informations.
+
+=item B<-U>, B<--username> ROLE
+
+Database user name (default: $PGUSER or "postgres").
+
+See section C<CONNECTIONS> for more informations.
+
+=item B<-p>, B<--port> PORT
+
+Database server port (default: $PGPORT or "5432").
+
+See section C<CONNECTIONS> for more informations.
+
+=item B<-S>, B<--dbservice> SERVICE_NAME
+
+The connection service name from pg_service.conf to use.
+
+See section C<CONNECTIONS> for more informations.
+
+=item B<-w>, B<--warning> THRESHOLD
+
+The Warning threshold.
+
+=item B<-c>, B<--critical> THRESHOLD
+
+The Critical threshold.
+
+=item B<-F>, B<--format> OUTPUT_FORMAT
+
+The output format. Supported output are: C<binary>, C<debug>, C<human>,
+C<nagios>, C<nagios_strict>, C<json> and C<json_strict>.
+
+Using the C<binary> format, the results are written in a binary file (using
+perl module C<Storable>) given in argument C<--output>. If no output is given,
+defaults to file C<check_pgbouncer.out> in the same directory as the script.
+
+The C<nagios_strict> and C<json_strict> formats are equivalent to the C<nagios>
+and C<json> formats respectively. The only difference is that they enforce the
+units to follow the strict Nagios specs: B, c, s or %. Any unit absent from
+this list is dropped (Bps, Tps, etc).
+
+=item B<-P>, B<--psql> FILE
+
+Path to the C<psql> executable (default: "psql").
+
+Because check_pgbouncer uses C<psql -w>, C<psql> must be version 8.4 at least.
+
+=item B<-l>, B<--list>
+
+List available services.
+
+=item B<-V>, B<--version>
+
+Print version and exit.
+
+=item B<--debug>
+
+Print some debug messages.
+
+=item B<-?>, B<--help>
+
+Show this help page.
+
+=back
+
+=head2 CONNECTIONS
+
+check_pgbouncer allows two different connection specifications: by service or
+by specifying values for host, user, port, and database. Some services can run
+on multiple hosts, or needs to connect to multiple hosts.
+
+You might specify one of the parameters below to connect to your PostgreSQL
+instance. If you don't, no connection parameters are given to psql: connection
+relies on binary defaults and environment.
+
+The format for connection parameters is:
+
+=over
+
+=item B<Parameter> C<--dbservice SERVICE_NAME>
+
+Define a new host using the given service. Multiple hosts can be defined by
+listing multiple services separated by a comma. Eg.
+
+  --dbservice service1,service2
+
+For more information about service definition, see:
+L<https://www.postgresql.org/docs/current/libpq-pgservice.html>
+
+=item B<Parameters> C<--host HOST>, C<--port PORT>, or C<--user ROLE>
+
+One parameter is enough to define a new host. Usual environment variables
+(PGHOST, PGPORT, PGUSER, PGSERVICE, PGPASSWORD) or default values are used for
+missing parameters.
+
+As for usual PostgreSQL tools, there is no command line argument to set the
+password, to avoid exposing it. Use PGPASSWORD, .pgpass or a service file
+(recommended).
+
+If multiple values are given, define as many host as maximum given values.
+
+Values are associated by position. Eg.:
+
+  --host h1,h2 --port 5432,5433
+
+Means "host=h1 port=5432" and "host=h2 port=5433".
+
+If the number of values is different between parameters, any host missing a
+parameter will use the first given value for this parameter. Eg.:
+
+  --host h1,h2 --port 5433
+
+Means: "host=h1 port=5433" and "host=h2 port=5433".
+
+=item B<Services are defined first>
+
+For instance:
+
+  --dbservice s1 --host h1 --port 5433
+
+means: use "service=s1" and "host=h1 port=5433" in this order. If the service
+supports only one host, the second host is ignored.
+
+=item B<Mutual exclusion between both methods>
+
+You can not overwrite services connections variables with parameters C<--host
+HOST>, C<--port PORT>, or C<--user ROLE>.
+
+=back
+
+=head2 SERVICES
+
+Descriptions and parameters of available services.
+
+=over
+
+=item B<is_paused>
+
+Checks if pgBouncer is paused.
+
+Perfdata returned:
+  * paused status (0 no, 1 yes)
+
+=item B<pgb_version>
+
+Check if this script is running the given version of check_pgbouncer. You must
+provide the expected version using either C<--warning> OR C<--critical>.
+
+No perfdata is returned.
+
+=item B<version>
+
+Check if the cluster is running the given version of pgBouncer. You must
+provide the expected version using either C<--warning> OR C<--critical>.
+
+Perfdata returns the numerical version of PostgreSQL.
+
+=back
+
+=head2 EXAMPLES
+
+=over
+
+=item Execute service "version" on host "host=localhost port=6432":
+
+  check_pgbouncer -h localhost -p 6432 -s version -w 1.25.0
+
+=back
+
+=head1 VERSION
+
+check_pgbouncer version 0.1, released on Wed Oct 07 2026.
+
+=head1 LICENSING
+
+This program is open source, licensed under the PostgreSQL license.
+For license terms, see the LICENSE provided with the sources.
+
+=head1 AUTHORS
+
+S<Author: Open PostgreSQL Monitoring Development Group>
+S<Copyright: (C) 2026 Open PostgreSQL Monitoring Development Group>
+

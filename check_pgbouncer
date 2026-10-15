@@ -1,0 +1,1037 @@
+#!/usr/bin/perl
+# This program is open source, licensed under the PostgreSQL License.
+# For license terms, see the LICENSE file.
+#
+#  Copyright (C) 2026: Open PostgreSQL Monitoring Development Group
+
+=head1 NAME
+
+check_pgbouncer - pgBouncer plugin for Nagios
+
+=head1 SYNOPSIS
+
+  check_pgbouncer {-w|--warning THRESHOLD} {-c|--critical THRESHOLD} [-s|--service SERVICE ] [-h|--host HOST] [-U|--username ROLE] [-p|--port PORT] [-d|--dbname DATABASE] [-S|--dbservice SERVICE_NAME] [-P|--psql PATH] [--debug]
+  check_pgbouncer [-l|--list]
+  check_pgbouncer [--help]
+
+=head1 DESCRIPTION
+
+check_pgbouncer is designed to monitor pgBouncer service from Nagios. It offers
+many options to measure and monitor useful performance metrics.
+
+=head1 COMPATIBILITY
+
+Each service is available from a different pgBouncer version.
+
+Ideally, the psql client should be 8.4 at least. If your client is older, see
+C<--psql> and C<--old-psql> for more information.
+
+Please report any undocumented incompatibility.
+
+=cut
+
+use vars qw($VERSION $PROGRAM);
+
+use strict;
+use warnings;
+use 5.008;
+
+use POSIX;
+use Data::Dumper;
+use File::Basename;
+use File::Spec;
+use File::Temp ();
+use Getopt::Long qw(:config bundling no_ignore_case_always);
+use List::Util qw(max);
+use Pod::Usage;
+use Scalar::Util qw(looks_like_number);
+use Fcntl qw(:flock);
+use Storable qw(retrieve store);
+use Time::HiRes qw(gettimeofday tv_interval);
+
+use Config;
+use FindBin;
+
+# messing with PATH so pod2usage always finds this script
+my @path = split /$Config{'path_sep'}/ => $ENV{'PATH'};
+push @path => $FindBin::Bin;
+$ENV{'PATH'} = join $Config{'path_sep'} => @path;
+undef @path;
+
+# force the env in English
+delete $ENV{'LC_ALL'};
+$ENV{'LC_ALL'} = 'C';
+setlocale( LC_ALL, 'C' );
+delete $ENV{'LANG'};
+delete $ENV{'LANGUAGE'};
+
+$| = 1;
+
+$VERSION = '0.1dev';
+$PROGRAM = 'check_pgbouncer';
+
+#my $PG_VERSION_190 = 190000;
+
+# reference to the output sub
+my $output_fmt;
+
+# Available services and descriptions.
+#
+# The referenced sub called to exec each service takes one parameter: a
+# reference to the arguments hash (%args)
+#
+# Note that we cannot use Perl prototype for these subroutine as they are
+# called indirectly (thus the args given by references).
+#
+# When you add one, list them in alphabetical order.
+
+my %services = (
+    # 'service_name' => {
+    #    'sub'     => sub reference to call to run this service
+    #    'desc'    => 'a description of the service'
+    # }
+
+    'is_paused' => {
+        'sub'  => \&check_is_paused,
+        'desc' => 'Check if pooling is paused.'
+    },
+    'cpgb_version' => {
+        'sub'  => \&check_cpgb_version,
+        'desc' => 'Check the version of this check_pgbouncer script.'
+    },
+    'version' => {
+        'sub'  => \&check_version,
+        'desc' => 'Check if the pgBouncer version is the latest one.',
+    },
+);
+
+=over
+
+=item B<-s>, B<--service> SERVICE
+
+The Nagios service to run. See section SERVICES for a description of available
+services or use C<--list> for a short service and description list.
+
+=item B<-h>, B<--host> HOST
+
+pgBouncer server host or socket directory (default: $PGHOST or "localhost")
+
+See section C<CONNECTIONS> for more informations.
+
+=item B<-U>, B<--username> ROLE
+
+Database user name (default: $PGUSER or "postgres").
+
+See section C<CONNECTIONS> for more informations.
+
+=item B<-p>, B<--port> PORT
+
+Database server port (default: $PGPORT or "5432").
+
+See section C<CONNECTIONS> for more informations.
+
+=item B<-S>, B<--dbservice> SERVICE_NAME
+
+The connection service name from pg_service.conf to use.
+
+See section C<CONNECTIONS> for more informations.
+
+=item B<-w>, B<--warning> THRESHOLD
+
+The Warning threshold.
+
+=item B<-c>, B<--critical> THRESHOLD
+
+The Critical threshold.
+
+=item B<-F>, B<--format> OUTPUT_FORMAT
+
+The output format. Supported output are: C<binary>, C<debug>, C<human>,
+C<nagios>, C<nagios_strict>, C<json> and C<json_strict>.
+
+Using the C<binary> format, the results are written in a binary file (using
+perl module C<Storable>) given in argument C<--output>. If no output is given,
+defaults to file C<check_pgbouncer.out> in the same directory as the script.
+
+The C<nagios_strict> and C<json_strict> formats are equivalent to the C<nagios>
+and C<json> formats respectively. The only difference is that they enforce the
+units to follow the strict Nagios specs: B, c, s or %. Any unit absent from
+this list is dropped (Bps, Tps, etc).
+
+=item B<-P>, B<--psql> FILE
+
+Path to the C<psql> executable (default: "psql").
+
+Because check_pgbouncer uses C<psql -w>, C<psql> must be version 8.4 at least.
+
+=item B<-l>, B<--list>
+
+List available services.
+
+=item B<-V>, B<--version>
+
+Print version and exit.
+
+=item B<--debug>
+
+Print some debug messages.
+
+=item B<-?>, B<--help>
+
+Show this help page.
+
+=back
+
+=cut
+
+my %args = (
+    'service'                 => undef,
+    'host'                    => undef,
+    'username'                => undef,
+    'port'                    => undef,
+    'dbname'                  => undef,
+    'dbservice'               => undef,
+    'warning'                 => undef,
+    'critical'                => undef,
+    'psql'                    => undef,
+    'output'                  => dirname(__FILE__) . '/check_pgbouncer.out',
+    # service-specific parameters
+    'debug'                   => 0,
+    'format'                  => 'nagios',
+    'help'                    => 0,
+    'list'                    => 0,
+);
+
+# Set name of the program without path*
+my $orig_name = $0;
+$0 = $PROGRAM;
+
+# Die on kill -1, -2, -3 or -15
+$SIG{'HUP'} = $SIG{'INT'} = $SIG{'QUIT'} = $SIG{'TERM'} = \&terminate;
+
+# Handle SIG
+sub terminate() {
+    my ($signal) = @_;
+    die ("SIG $signal caught");
+}
+
+# Print the version and exit
+sub version() {
+    printf "check_pgbouncer version %s, Perl %vd\n",
+        $VERSION, $^V;
+
+    exit 0;
+}
+
+# List services that can be performed
+sub list_services() {
+
+    print "List of available services:\n\n";
+
+    foreach my $service ( sort keys %services ) {
+        printf "\t%-17s\t%s\n", $service, $services{$service}{'desc'};
+    }
+
+    exit 0;
+}
+
+=head2 CONNECTIONS
+
+check_pgbouncer allows two different connection specifications: by service or
+by specifying values for host, user, port, and database. Some services can run
+on multiple hosts, or needs to connect to multiple hosts.
+
+You might specify one of the parameters below to connect to your PostgreSQL
+instance. If you don't, no connection parameters are given to psql: connection
+relies on binary defaults and environment.
+
+The format for connection parameters is:
+
+=over
+
+=item B<Parameter> C<--dbservice SERVICE_NAME>
+
+Define a new host using the given service. Multiple hosts can be defined by
+listing multiple services separated by a comma. Eg.
+
+  --dbservice service1,service2
+
+For more information about service definition, see:
+L<https://www.postgresql.org/docs/current/libpq-pgservice.html>
+
+=item B<Parameters> C<--host HOST>, C<--port PORT>, or C<--user ROLE>
+
+One parameter is enough to define a new host. Usual environment variables
+(PGHOST, PGPORT, PGUSER, PGSERVICE, PGPASSWORD) or default values are used for
+missing parameters.
+
+As for usual PostgreSQL tools, there is no command line argument to set the
+password, to avoid exposing it. Use PGPASSWORD, .pgpass or a service file
+(recommended).
+
+If multiple values are given, define as many host as maximum given values.
+
+Values are associated by position. Eg.:
+
+  --host h1,h2 --port 5432,5433
+
+Means "host=h1 port=5432" and "host=h2 port=5433".
+
+If the number of values is different between parameters, any host missing a
+parameter will use the first given value for this parameter. Eg.:
+
+  --host h1,h2 --port 5433
+
+Means: "host=h1 port=5433" and "host=h2 port=5433".
+
+=item B<Services are defined first>
+
+For instance:
+
+  --dbservice s1 --host h1 --port 5433
+
+means: use "service=s1" and "host=h1 port=5433" in this order. If the service
+supports only one host, the second host is ignored.
+
+=item B<Mutual exclusion between both methods>
+
+You can not overwrite services connections variables with parameters C<--host
+HOST>, C<--port PORT>, or C<--user ROLE>.
+
+=back
+
+=cut
+
+sub parse_hosts(\%) {
+    my %args = %{ shift() };
+    my @hosts = ();
+
+    if (defined $args{'dbservice'}) {
+        push
+            @hosts,
+            {   'dbservice' => $_,
+                'name'      => "service:$_",
+                'pgversion' => undef
+            }
+        foreach split /,/, $args{'dbservice'};
+    }
+
+    # Add as many hosts than necessary depending on given parameters
+    # host/port/db/user.
+    # Any missing parameter will be set to its default value.
+    if (defined $args{'host'}
+        or defined $args{'username'}
+        or defined $args{'port'}
+    ) {
+        $args{'host'} = $ENV{'PGHOST'} || 'localhost'
+            unless defined $args{'host'};
+        $args{'username'} = $ENV{'PGUSER'} || 'postgres'
+            unless defined $args{'username'};
+        $args{'port'} = $ENV{'PGPORT'} || '5432'
+            unless defined $args{'port'};
+        $args{'dbname'} = 'pgbouncer';
+
+        my @dbhosts = split( /,/, $args{'host'} );
+        my @dbnames = split( /,/, $args{'dbname'} );
+        my @dbusers = split( /,/, $args{'username'} );
+        my @dbports = split( /,/, $args{'port'} );
+        my $nbhosts = max $#dbhosts, $#dbnames, $#dbusers, $#dbports;
+
+        # Take the first value for each connection property as default.
+        # eg. "-h localhost -p 5432,5433" gives two hosts:
+        #    * localhost:5432
+        #    * localhost:5433
+        for ( my $i = 0; $i <= $nbhosts; $i++ ) {
+            push(
+                @hosts,
+                {   'host'      => $dbhosts[$i] || $dbhosts[0],
+                    'port'      => $dbports[$i] || $dbports[0],
+                    'db'        => $dbnames[$i] || $dbnames[0],
+                    'user'      => $dbusers[$i] || $dbusers[0],
+                    'pgversion' => undef
+                }
+            );
+
+            $hosts[-1]{'name'} = sprintf('host:%s port:%d db:%s',
+                $hosts[-1]{'host'}, $hosts[-1]{'port'}, $hosts[-1]{'db'}
+            );
+        }
+    }
+
+    if ( not @hosts ) {
+        # No connection parameters given.
+        # The psql execution relies on binary defaults and env variables.
+        # We look for libpq environment variables to save them and preserve
+        # default psql behaviour as query() always resets them.
+        my $name = 'binary defaults';
+
+        push @hosts, {
+            'name'      => 'binary defaults',
+            'pgversion' => undef
+        };
+
+        $hosts[0]{'host'}      = $ENV{'PGHOST'}     if defined $ENV{'PGHOST'};
+        $hosts[0]{'port'}      = $ENV{'PGPORT'}     if defined $ENV{'PGPORT'};
+        $hosts[0]{'db'}        = 'pgbouncer';
+        $hosts[0]{'user'}      = $ENV{'PGUSER'}     if defined $ENV{'PGUSER'};
+        $hosts[0]{'dbservice'} = $ENV{'PGSERVICE'}  if defined $ENV{'PGSERVICE'};
+
+        if (defined $ENV{'PGHOST'} ) {
+            $hosts[0]{'host'} = $ENV{'PGHOST'};
+            $name .= " host:$ENV{'PGHOST'}";
+        }
+
+        if (defined $ENV{'PGPORT'} ) {
+            $hosts[0]{'port'} = $ENV{'PGPORT'};
+            $name .= " port:$ENV{'PGPORT'}";
+        }
+
+        $hosts[0]{'db'} = 'pgbouncer';
+        $name .= 'pgbouncer';
+
+        if (defined $ENV{'PGSERVICE'} ) {
+            $hosts[0]{'dbservice'} = $ENV{'PGSERVICE'};
+            $name .= " service:$ENV{'PGSERVICE'}";
+        }
+
+        $hosts[0]{'user'} = $ENV{'PGUSER'} if defined $ENV{'PGUSER'};
+
+        $hosts[0]{'name'} = $name;
+    }
+
+    dprint ('Hosts: '. Dumper(\@hosts));
+
+    return \@hosts;
+}
+
+# Execute a query on a host.
+# Params:
+#   * host
+#   * query
+#   * (optional) database
+#   * (optional) get_fields
+# The result is an array of arrays:
+#   [
+#     [column1, ...] # line1
+#     ...
+#   ]
+sub query($$;$$$) {
+    my $host       = shift;
+    my $query      = shift;
+    my $db         = shift;
+    my @res        = ();
+    my $res        = '';
+    my $RS         = chr(30); # ASCII RS  (record separator)
+    my $FS         = chr(3);  # ASCII ETX (end of text)
+    my $get_fields = shift;
+    my $onfail     = shift || \&status_unknown;
+    my $warg       = '-w';
+    my $tmpfile;
+    my $psqlcmd;
+    my $rc;
+
+    local $/ = undef;
+
+    delete $ENV{PGSERVICE};
+    delete $ENV{PGDATABASE};
+    delete $ENV{PGHOST};
+    delete $ENV{PGPORT};
+    delete $ENV{PGUSER};
+    delete $ENV{PGOPTIONS};
+
+    $ENV{PGAPPNAME}  = $PROGRAM."[".$args{'service'}."]";
+    $ENV{PGDATABASE} = $host->{'db'}        if defined $host->{'db'};
+    $ENV{PGSERVICE}  = $host->{'dbservice'} if defined $host->{'dbservice'};
+    $ENV{PGHOST}     = $host->{'host'}      if defined $host->{'host'};
+    $ENV{PGPORT}     = $host->{'port'}      if defined $host->{'port'};
+    $ENV{PGUSER}     = $host->{'user'}      if defined $host->{'user'};
+
+    dprint ("Query: $query\n");
+    dprint ("Env. service: $ENV{PGSERVICE} \n") if defined $host->{'dbservice'};
+    dprint ("Env. host   : $ENV{PGHOST}    \n") if defined $host->{'host'};
+    dprint ("Env. port   : $ENV{PGPORT}    \n") if defined $host->{'port'};
+    dprint ("Env. user   : $ENV{PGUSER}    \n") if defined $host->{'user'};
+    dprint ("Env. db     : $ENV{PGDATABASE}\n") if defined $host->{'db'};
+
+    $warg = '' if $args{'old-psql'} or $ENV{'CHECK_PGA_OLD_PSQL'};
+
+    $tmpfile = File::Temp->new(
+        TEMPLATE => 'check_pga-XXXXXXXX',
+        DIR      => $args{'tmpdir'}
+    ) or die "Could not create or write in a temp file!";
+
+    print $tmpfile "$query;" or die "Could not create or write in a temp file!";
+
+    $psqlcmd  = qq{ $args{'psql'} $warg --set "ON_ERROR_STOP=1" }
+              . qq{ -qXAf $tmpfile -R $RS -F $FS };
+    $psqlcmd .= qq{ --dbname='$db' } if defined $db;
+    $res      = qx{ $psqlcmd 2>&1 };
+    $rc       = $?;
+
+    dprint("Query rc: $rc\n");
+    dprint( sprintf( "  stderr (%u): «%s»\n", length $res, $res ) )
+        if $rc;
+
+    if ($rc != 0) {
+        exit $onfail->('check_pgbouncer', [ "Query failed on $db !\n" . $res ] ) if defined $db;
+        exit $onfail->('check_pgbouncer', [ "Query failed !\n" . $res ] ) unless $rc == 0;
+    }
+
+    if (defined $res) {
+        chop $res;
+        my $col_num;
+
+        push @res, [ split(chr(3) => $_, -1) ]
+            foreach split (chr(30) => $res, -1);
+
+        $col_num = scalar( @{ $res[0] } );
+
+        shift @res unless defined $get_fields;
+        pop @res if $res[-1][0] =~ m/^\(\d+ rows?\)$/;
+
+        # check the number of column is valid.
+        # FATAL if the parsing was unsuccessful, eg. if one field contains x30
+        # or x03.  see gh issue #155
+        foreach my $row ( @res ) {
+            exit status_unknown('check_pgbouncer',
+                [ "Could not parse query result!\n" ]
+            ) if scalar( @$row ) != $col_num;
+        }
+    }
+
+    dprint( "Query result: ". Dumper( \@res ) );
+
+    return \@res;
+}
+
+sub dprint {
+    return unless $args{'debug'};
+    foreach (@_) {
+        print "DEBUG: $_";
+    }
+}
+
+sub status_unknown($;$$$) {
+    return $output_fmt->( 3, $_[0], $_[1], $_[2], $_[3] );
+}
+
+sub status_critical($;$$$) {
+    return $output_fmt->( 2, $_[0], $_[1], $_[2], $_[3] );
+}
+
+sub status_warning($;$$$) {
+    return $output_fmt->( 1, $_[0], $_[1], $_[2], $_[3] );
+}
+
+sub status_ok($;$$$) {
+    return $output_fmt->( 0, $_[0], $_[1], $_[2], $_[3] );
+}
+
+sub bin_output ($$;$$$) {
+    my $rc      = shift;
+    my $service = shift;
+    my $storage = $args{'output'};
+    my $ref;
+    my @msg;
+    my @perfdata;
+    my @longmsg;
+
+    @msg      = @{ $_[0] } if defined $_[0];
+    @perfdata = @{ $_[1] } if defined $_[1];
+    @longmsg  = @{ $_[2] } if defined $_[2];
+
+    $ref = {
+        'timestamp' => time,
+        'rc'        => $rc,
+        'service'   => $service,
+        'messages'  => \@msg,
+        'perfdata'  => \@perfdata,
+        'longmsg'   => \@longmsg
+    };
+
+    my $fn_record = sub {
+        my $s = shift;
+        $s->{ $args{'service'} } = $ref;
+    };
+
+    save_internal($fn_record, $storage);
+}
+
+sub debug_output ($$;$$$) {
+    my $rc      = shift;
+    my $service = shift;
+    my $ret;
+    my @msg;
+    my @perfdata;
+    my @longmsg;
+
+    @msg      = @{ $_[0] } if defined $_[0];
+    @perfdata = @{ $_[1] } if defined $_[1];
+    @longmsg  = @{ $_[2] } if defined $_[2];
+
+    $ret  = sprintf "%-15s: %s\n", 'Service', $service;
+
+    $ret .= sprintf "%-15s: 0 (%s)\n", "Returns", "OK"       if $rc == 0;
+    $ret .= sprintf "%-15s: 1 (%s)\n", "Returns", "WARNING"  if $rc == 1;
+    $ret .= sprintf "%-15s: 2 (%s)\n", "Returns", "CRITICAL" if $rc == 2;
+    $ret .= sprintf "%-15s: 3 (%s)\n", "Returns", "UNKNOWN"  if $rc == 3;
+
+    $ret .= sprintf "%-15s: %s\n", "Message", $_ foreach @msg;
+    $ret .= sprintf "%-15s: %s\n", "Long message", $_ foreach @longmsg;
+    $ret .= sprintf "%-15s: %s\n", "Perfdata",
+        Data::Dumper->new([ $_ ])->Indent(0)->Terse(1)->Dump foreach @perfdata;
+
+    print $ret;
+
+    return $rc;
+}
+
+sub human_output ($$;$$$) {
+    my $rc      = shift;
+    my $service = shift;
+    my $ret;
+    my @msg;
+    my @perfdata;
+    my @longmsg;
+
+    @msg      = @{ $_[0] } if defined $_[0];
+    @perfdata = @{ $_[1] } if defined $_[1];
+    @longmsg  = @{ $_[2] } if defined $_[2];
+
+    $ret  = sprintf "%-15s: %s\n", 'Service', $service;
+
+    $ret .= sprintf "%-15s: 0 (%s)\n", "Returns", "OK"       if $rc == 0;
+    $ret .= sprintf "%-15s: 1 (%s)\n", "Returns", "WARNING"  if $rc == 1;
+    $ret .= sprintf "%-15s: 2 (%s)\n", "Returns", "CRITICAL" if $rc == 2;
+    $ret .= sprintf "%-15s: 3 (%s)\n", "Returns", "UNKNOWN"  if $rc == 3;
+
+    $ret .= sprintf "%-15s: %s\n", "Message", $_ foreach @msg;
+    $ret .= sprintf "%-15s: %s\n", "Long message", $_ foreach @longmsg;
+
+    foreach my $perfdata ( @perfdata ) {
+        map {$_ = undef unless defined $_} @{$perfdata}[2..6];
+
+        if ( defined $$perfdata[2] and $$perfdata[2] =~ /B$/ ) {
+            $ret .= sprintf "%-15s: %s=%s", "Perfdata",
+                $$perfdata[0], to_size($$perfdata[1]);
+            $ret .= sprintf " warn=%s", to_size( $$perfdata[3] ) if defined $$perfdata[3];
+            $ret .= sprintf " crit=%s", to_size( $$perfdata[4] ) if defined $$perfdata[4];
+            $ret .= sprintf " min=%s", to_size( $$perfdata[5] ) if defined $$perfdata[5];
+            $ret .= sprintf " max=%s", to_size( $$perfdata[6] ) if defined $$perfdata[6];
+            $ret .= "\n";
+        }
+        elsif ( defined $$perfdata[2] and $$perfdata[2] =~ /\ds$/ ) {
+            $ret .= sprintf "%-15s: %s=%s", "Perfdata",
+                $$perfdata[0], to_interval( $$perfdata[1] );
+            $ret .= sprintf " warn=%s", to_interval( $$perfdata[3] ) if defined $$perfdata[3];
+            $ret .= sprintf " crit=%s", to_interval( $$perfdata[4] ) if defined $$perfdata[4];
+            $ret .= sprintf " min=%s", to_interval( $$perfdata[5] ) if defined $$perfdata[5];
+            $ret .= sprintf " max=%s", to_interval( $$perfdata[6] ) if defined $$perfdata[6];
+            $ret .= "\n";
+        }
+        else {
+            $ret .= sprintf "%-15s: %s=%s", "Perfdata",
+                $$perfdata[0], $$perfdata[1];
+            $ret .= sprintf "%s", $$perfdata[2] if defined $$perfdata[2];
+            $ret .= sprintf " warn=%s", $$perfdata[3] if defined $$perfdata[3];
+            $ret .= sprintf " crit=%s", $$perfdata[4] if defined $$perfdata[4];
+            $ret .= sprintf " min=%s", $$perfdata[5] if defined $$perfdata[5];
+            $ret .= sprintf " max=%s", $$perfdata[6] if defined $$perfdata[6];
+            $ret .= "\n";
+        }
+    }
+
+    print $ret;
+
+    return $rc;
+}
+
+sub nagios_output ($$;$$$) {
+    my $rc  = shift;
+    my $ret = shift;
+    my @msg;
+    my @perfdata;
+    my @longmsg;
+
+    $ret .= " OK"       if $rc == 0;
+    $ret .= " WARNING"  if $rc == 1;
+    $ret .= " CRITICAL" if $rc == 2;
+    $ret .= " UNKNOWN"  if $rc == 3;
+
+    @msg      = @{ $_[0] } if defined $_[0];
+    @perfdata = @{ $_[1] } if defined $_[1];
+    @longmsg  = @{ $_[2] } if defined $_[2];
+
+    $ret .= ": ".  join( ', ', @msg )     if @msg;
+    if ( scalar @perfdata ) {
+        $ret .= " |";
+        foreach my $perf ( @perfdata ) {
+            # escape quotes
+            $$perf[0] =~ s/'/''/g;
+            # surounding quotes if space in the label
+            $$perf[0] = "'$$perf[0]'" if $$perf[0] =~ /\s/;
+            # the perfdata itself and its unit
+            $ret .= " $$perf[0]=$$perf[1]";
+
+            # init and join optional values (unit/warn/crit/min/max)
+            map {$_ = "" unless defined $_} @{$perf}[2..6];
+            $ret .= join ';' => @$perf[2..6];
+
+            # remove useless semi-colons at end
+            $ret =~ s/;*$//;
+        }
+    }
+    $ret .= "\n". join( ' ', @longmsg ) if @longmsg;
+
+    print $ret;
+
+    return $rc;
+}
+
+sub set_strict_perfdata {
+    my $perfdata = shift;
+
+    map {
+        $$_[1] = 'U' if $$_[1] eq 'NaN';
+        $$_[2] = ''  if exists $$_[2]
+                     and defined $$_[2]
+                     and $$_[2] !~ /\A[Bcs%]\z/;
+    } @{ $perfdata };
+}
+
+sub nagios_strict_output ($$;$$$) {
+    my $rc  = shift;
+    my $ret = shift;
+    my @msg;
+    my @perfdata;
+    my @longmsg;
+
+    @msg      = @{ $_[0] } if defined $_[0];
+    @perfdata = @{ $_[1] } if defined $_[1];
+    @longmsg  = @{ $_[2] } if defined $_[2];
+
+    set_strict_perfdata ( \@perfdata );
+
+    return nagios_output( $rc, $ret, \@msg, \@perfdata, \@longmsg );
+}
+
+sub json_output ($$;$$$) {
+    my $rc  = shift;
+    my $service = shift;
+    my @msg;
+    my @perfdata;
+    my @longmsg;
+
+    @msg      = @{ $_[0] } if defined $_[0];
+    @perfdata = @{ $_[1] } if defined $_[1];
+    @longmsg  = @{ $_[2] } if defined $_[2];
+
+    my $obj = {};
+    $obj->{'service'} = $service;
+    $obj->{'status'} = 'OK' if $rc == 0;
+    $obj->{'status'} = 'WARNING' if $rc == 1;
+    $obj->{'status'} = 'CRITICAL' if $rc == 2;
+    $obj->{'status'} = 'UNKNOWN' if $rc == 3;
+    $obj->{'msg'} = \@msg;
+    $obj->{'longmsg'} = \@longmsg;
+
+    my %data = map{ $$_[0] => {
+            'val' => $$_[1],
+            'unit' => $$_[2],
+            'warn' => $$_[3],
+            'crit' => $$_[4],
+            'min' => $$_[5],
+            'max' => $$_[6] }
+    } @perfdata;
+    $obj->{'perfdata'} = \%data;
+
+    print encode_json( $obj );
+    return $rc;
+}
+
+sub json_strict_output ($$;$$$) {
+    my $rc  = shift;
+    my $ret = shift;
+    my @msg;
+    my @perfdata;
+    my @longmsg;
+
+    @msg      = @{ $_[0] } if defined $_[0];
+    @perfdata = @{ $_[1] } if defined $_[1];
+    @longmsg  = @{ $_[2] } if defined $_[2];
+
+    set_strict_perfdata ( \@perfdata );
+
+    return json_output( $rc, $ret, \@msg, \@perfdata, \@longmsg );
+}
+
+=head2 SERVICES
+
+Descriptions and parameters of available services.
+
+=over
+
+=item B<is_paused>
+
+Checks if pgBouncer is paused.
+
+Perfdata returned:
+  * paused status (0 no, 1 yes)
+
+=cut
+
+sub check_is_paused {
+    my @rs;
+    my @hosts;
+    my $msg;
+    my $is_paused = '';
+    my %args      = %{ $_[0] };
+    my $me        = 'PGBOUNCER_IS_PAUSED';
+    my $query     = q{ SHOW STATE };
+
+    @hosts = @{ parse_hosts %args };
+
+    pod2usage(
+        -message => 'FATAL: you must give only one host with service "version".',
+        -exitval => 127
+    ) if @hosts != 1;
+
+    @rs = @{ query( $hosts[0], $query ) };
+    REC_LOOP: foreach my $r (@rs) {
+        $is_paused = $r->[1] if $r->[0] eq 'paused';
+    }
+
+    return status_critical( $me, [ "pgBouncer is paused" ] )
+        if $is_paused eq 'yes';
+
+    return status_ok( $me, [ "pgBouncer is active" ] );
+}
+
+=item B<cpgb_version>
+
+Check if this script is running the given version of check_pgbouncer. You must
+provide the expected version using either C<--warning> OR C<--critical>.
+
+No perfdata is returned.
+
+=cut
+
+sub check_cpgb_version {
+    my @rs;
+    my @hosts;
+    my %args = %{ $_[0] };
+    my $me   = 'CHECKPGBOUNCER_VERSION';
+    my $msg  = "check_pgbouncer $VERSION%s, Perl %vd";
+
+    pod2usage(
+        -message => 'FATAL: you must provide a warning or a critical threshold for service cpgb_version!',
+        -exitval => 127
+    ) if (defined $args{'critical'} and defined $args{'warning'})
+        or (not defined $args{'critical'} and not defined $args{'warning'});
+
+    pod2usage(
+        -message => "FATAL: given version does not look like a check_pgbouncer version!",
+        -exitval => 127
+    ) if ( defined $args{'critical'} and $args{'critical'} !~ m/^\d\.\d+(?:_?(?:dev|beta|rc)\d*)?$/ )
+        or (defined $args{'warning'} and $args{'warning'} !~ m/^\d\.\d+(?:_?(?:dev|beta|rc)\d*)?$/ );
+
+    return status_critical( $me,
+        [ sprintf($msg, " (should be $args{'critical'}!)", $^V) ]
+    ) if defined $args{'critical'} and $VERSION ne $args{'critical'};
+
+    return status_warning( $me,
+        [ sprintf($msg, " (should be $args{'warning'}!)", $^V) ]
+    ) if defined $args{'warning'} and $VERSION ne $args{'warning'};
+
+    return status_ok( $me, [ sprintf($msg, "", $^V) ] );
+}
+
+=item B<version>
+
+Check if the cluster is running the given version of pgBouncer. You must
+provide the expected version using either C<--warning> OR C<--critical>.
+
+Perfdata returns the numerical version of PostgreSQL.
+
+=cut
+
+sub check_version {
+    my @rs;
+    my @hosts;
+    my $msg;
+    my $version;
+    my %args  = %{ $_[0] };
+    my $me    = 'PGBOUNCER_VERSION';
+    my $query = q{ SHOW VERSION };
+
+    pod2usage(
+        -message => 'FATAL: you must provide a warning or a critical threshold for service version!',
+        -exitval => 127
+    ) if (defined $args{'critical'} and defined $args{'warning'})
+        or (not defined $args{'critical'} and not defined $args{'warning'});
+
+    pod2usage(
+        -message => "FATAL: given version does not look like a pgbouncer version!",
+        -exitval => 127
+    ) if ( defined $args{'critical'} and $args{'critical'} !~ m/^\d\.\d+\.\d*$/ )
+        or (defined $args{'warning'} and $args{'warning'} !~ m/^\d\.\d+\.\d*$/ );
+
+    $version = defined $args{'warning'} ?
+        $args{'warning'} :
+        $args{'critical'};
+
+    @hosts = @{ parse_hosts %args };
+
+    pod2usage(
+        -message => 'FATAL: you must give only one host with service "version".',
+        -exitval => 127
+    ) if @hosts != 1;
+
+    @rs = @{ query( $hosts[0], $query ) };
+    dprint $rs[0][0];
+
+    $rs[0][0] =~ m/^PgBouncer (\d+\.\d+\.\d+)$/;
+
+    if (defined $1) {
+        $msg = "pgBouncer $1" if defined $1;
+
+        return status_critical( $me, [ $msg . " (should be $version!)" ] )
+            unless $1 eq $version;
+
+        return status_ok( $me, [ $msg ] );
+    } else {
+        return status_unknown( $me, [ "Cannot access to version." ]);
+    }
+}
+
+# End of SERVICE section in pod doc
+=pod
+
+=back
+
+=cut
+
+Getopt::Long::Configure('bundling');
+GetOptions(
+    \%args,
+        'critical|c=s',
+        'dbname|d=s',
+        'dbservice|S=s',
+        'debug!',
+        'format|F=s',
+        'help|?!',
+        'host|h=s',
+        'list|l!',
+        'old-psql!',
+        'output|o=s',
+        'path=s',
+        'port|p=s',
+        'psql|P=s',
+        'service|s=s',
+        'tmpdir=s',
+        'version|V!',
+        'warning|w=s',
+) or pod2usage( -exitval => 127 );
+
+list_services() if $args{'list'};
+version()       if $args{'version'};
+
+pod2usage( -verbose => 2 ) if $args{'help'};
+
+# One service must be given
+pod2usage(
+    -message => "FATAL: you must specify one service.\n"
+        . "    See -s or --service command line option.",
+    -exitval => 127
+) unless defined $args{'service'};
+
+
+# Check that the given service exists.
+pod2usage(
+    -message => "FATAL: service $args{'service'} does not exist.\n"
+        . "    Use --list to show the available services.",
+    -exitval => 127
+) unless exists $services{ $args{'service'} };
+
+
+# Both critical and warning must be given is optional,
+# but for pga_version, minor_version, settings, and uptime which use only one of them or none
+pod2usage(
+    -message => 'FATAL: you must provide both warning and critical thresholds.',
+    -exitval => 127
+) if $args{'service'} !~ m/^(cpgb_version|version)$/ and (
+    ( defined $args{'critical'} and not defined $args{'warning'} )
+    or ( not defined $args{'critical'} and defined $args{'warning'} ));
+
+# Set psql absolute path
+unless ($args{'psql'}) {
+    if ( $ENV{PGBINDIR} ) {
+        $args{'psql'} = "$ENV{PGBINDIR}/psql";
+    }
+    else {
+        $args{'psql'} = 'psql';
+    }
+}
+
+# Pre-compile given regexp
+unless (($args{'service'} eq 'pg_dump_backup')
+     or ($args{'service'} eq 'oldest_idlexact')
+     or ($args{'service'} eq 'oldest_xact')
+     ) {
+    $_ = qr/$_/ for @{ $args{'exclude'} } ;
+    $_ = qr/$_/ for @{ $args{'dbinclude'} };
+}
+
+$_ = qr/$_/ for @{ $args{'dbexclude'} };
+
+# Output format
+for ( $args{'format'} ) {
+       if ( /^binary$/        ) { $output_fmt = \&bin_output  }
+    elsif ( /^debug$/         ) { $output_fmt = \&debug_output  }
+    elsif ( /^human$/         ) { $output_fmt = \&human_output  }
+    elsif ( /^nagios$/        ) { $output_fmt = \&nagios_output }
+    elsif ( /^nagios_strict$/ ) { $output_fmt = \&nagios_strict_output }
+    elsif ( /^json$/          ) { $output_fmt = \&json_output }
+    elsif ( /^json_strict$/   ) { $output_fmt = \&json_strict_output }
+    else {
+        pod2usage(
+            -message => "FATAL: unrecognized output format \"$_\" (see \"--format\")",
+            -exitval => 127
+        );
+    }
+}
+
+if ( $args{'format'} =~ '^json' ) {
+    require JSON::PP;
+    JSON::PP->import;
+}
+
+exit $services{ $args{'service'} }{'sub'}->( \%args );
+
+__END__
+
+=head2 EXAMPLES
+
+=over
+
+=item Execute service "version" on host "host=localhost port=6432":
+
+  check_pgbouncer -h localhost -p 6432 -s version -w 1.25.0
+
+=back
+
+=head1 VERSION
+
+check_pgbouncer version 0.1, released on Wed Oct 07 2026.
+
+=head1 LICENSING
+
+This program is open source, licensed under the PostgreSQL license.
+For license terms, see the LICENSE provided with the sources.
+
+=head1 AUTHORS
+
+S<Author: Open PostgreSQL Monitoring Development Group>
+S<Copyright: (C) 2026 Open PostgreSQL Monitoring Development Group>
+
+=cut

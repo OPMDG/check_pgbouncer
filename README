@@ -1,0 +1,180 @@
+NAME
+    check_pgbouncer - pgBouncer plugin for Nagios
+
+SYNOPSIS
+      check_pgbouncer {-w|--warning THRESHOLD} {-c|--critical THRESHOLD} [-s|--service SERVICE ] [-h|--host HOST] [-U|--username ROLE] [-p|--port PORT] [-d|--dbname DATABASE] [-S|--dbservice SERVICE_NAME] [-P|--psql PATH] [--debug]
+      check_pgbouncer [-l|--list]
+      check_pgbouncer [--help]
+
+DESCRIPTION
+    check_pgbouncer is designed to monitor pgBouncer service from Nagios. It
+    offers many options to measure and monitor useful performance metrics.
+
+COMPATIBILITY
+    Each service is available from a different pgBouncer version.
+
+    Ideally, the psql client should be 8.4 at least. If your client is
+    older, see "--psql" and "--old-psql" for more information.
+
+    Please report any undocumented incompatibility.
+
+    -s, --service SERVICE
+        The Nagios service to run. See section SERVICES for a description of
+        available services or use "--list" for a short service and
+        description list.
+
+    -h, --host HOST
+        pgBouncer server host or socket directory (default: $PGHOST or
+        "localhost")
+
+        See section "CONNECTIONS" for more informations.
+
+    -U, --username ROLE
+        Database user name (default: $PGUSER or "postgres").
+
+        See section "CONNECTIONS" for more informations.
+
+    -p, --port PORT
+        Database server port (default: $PGPORT or "5432").
+
+        See section "CONNECTIONS" for more informations.
+
+    -S, --dbservice SERVICE_NAME
+        The connection service name from pg_service.conf to use.
+
+        See section "CONNECTIONS" for more informations.
+
+    -w, --warning THRESHOLD
+        The Warning threshold.
+
+    -c, --critical THRESHOLD
+        The Critical threshold.
+
+    -F, --format OUTPUT_FORMAT
+        The output format. Supported output are: "binary", "debug", "human",
+        "nagios", "nagios_strict", "json" and "json_strict".
+
+        Using the "binary" format, the results are written in a binary file
+        (using perl module "Storable") given in argument "--output". If no
+        output is given, defaults to file "check_pgbouncer.out" in the same
+        directory as the script.
+
+        The "nagios_strict" and "json_strict" formats are equivalent to the
+        "nagios" and "json" formats respectively. The only difference is
+        that they enforce the units to follow the strict Nagios specs: B, c,
+        s or %. Any unit absent from this list is dropped (Bps, Tps, etc).
+
+    -P, --psql FILE
+        Path to the "psql" executable (default: "psql").
+
+        Because check_pgbouncer uses "psql -w", "psql" must be version 8.4
+        at least.
+
+    -l, --list
+        List available services.
+
+    -V, --version
+        Print version and exit.
+
+    --debug
+        Print some debug messages.
+
+    -?, --help
+        Show this help page.
+
+  CONNECTIONS
+    check_pgbouncer allows two different connection specifications: by
+    service or by specifying values for host, user, port, and database. Some
+    services can run on multiple hosts, or needs to connect to multiple
+    hosts.
+
+    You might specify one of the parameters below to connect to your
+    PostgreSQL instance. If you don't, no connection parameters are given to
+    psql: connection relies on binary defaults and environment.
+
+    The format for connection parameters is:
+
+    Parameter "--dbservice SERVICE_NAME"
+        Define a new host using the given service. Multiple hosts can be
+        defined by listing multiple services separated by a comma. Eg.
+
+          --dbservice service1,service2
+
+        For more information about service definition, see:
+        <https://www.postgresql.org/docs/current/libpq-pgservice.html>
+
+    Parameters "--host HOST", "--port PORT", or "--user ROLE"
+        One parameter is enough to define a new host. Usual environment
+        variables (PGHOST, PGPORT, PGUSER, PGSERVICE, PGPASSWORD) or default
+        values are used for missing parameters.
+
+        As for usual PostgreSQL tools, there is no command line argument to
+        set the password, to avoid exposing it. Use PGPASSWORD, .pgpass or a
+        service file (recommended).
+
+        If multiple values are given, define as many host as maximum given
+        values.
+
+        Values are associated by position. Eg.:
+
+          --host h1,h2 --port 5432,5433
+
+        Means "host=h1 port=5432" and "host=h2 port=5433".
+
+        If the number of values is different between parameters, any host
+        missing a parameter will use the first given value for this
+        parameter. Eg.:
+
+          --host h1,h2 --port 5433
+
+        Means: "host=h1 port=5433" and "host=h2 port=5433".
+
+    Services are defined first
+        For instance:
+
+          --dbservice s1 --host h1 --port 5433
+
+        means: use "service=s1" and "host=h1 port=5433" in this order. If
+        the service supports only one host, the second host is ignored.
+
+    Mutual exclusion between both methods
+        You can not overwrite services connections variables with parameters
+        "--host HOST", "--port PORT", or "--user ROLE".
+
+  SERVICES
+    Descriptions and parameters of available services.
+
+    is_paused
+        Checks if pgBouncer is paused.
+
+        Perfdata returned: * paused status (0 no, 1 yes)
+
+    pgb_version
+        Check if this script is running the given version of
+        check_pgbouncer. You must provide the expected version using either
+        "--warning" OR "--critical".
+
+        No perfdata is returned.
+
+    version
+        Check if the cluster is running the given version of pgBouncer. You
+        must provide the expected version using either "--warning" OR
+        "--critical".
+
+        Perfdata returns the numerical version of PostgreSQL.
+
+  EXAMPLES
+    Execute service "version" on host "host=localhost port=6432":
+          check_pgbouncer -h localhost -p 6432 -s version -w 1.25.0
+
+VERSION
+    check_pgbouncer version 0.1, released on Wed Oct 07 2026.
+
+LICENSING
+    This program is open source, licensed under the PostgreSQL license. For
+    license terms, see the LICENSE provided with the sources.
+
+AUTHORS
+    Author: Open PostgreSQL Monitoring Development Group
+    Copyright: (C) 2026 Open PostgreSQL Monitoring Development Group
+
